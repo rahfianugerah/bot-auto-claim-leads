@@ -39,6 +39,13 @@ PORT = int(os.environ.get("PORT", "8080"))
 # DMs us in a new context.
 LEAD_BOT_USERNAME = os.environ["LEAD_BOT_USERNAME"].strip().lstrip("@")
 
+# Diagnostic knob: some vendor backends send the Telegram notification
+# slightly before the lead record is actually committed/claimable, so a
+# sub-second reaction can get a false "not found" that a slower human
+# reaction wouldn't hit. Set via env var so it can be tuned without a
+# code change while narrowing down the real minimum delay.
+CLAIM_DELAY_SECONDS = 1.25
+
 # Primary: the bot's own literal command line - whatever characters appear
 # here are, by definition, exactly what the bot expects back, so this is
 # more trustworthy than any other field in the message.
@@ -91,6 +98,9 @@ async def handle_new_lead(event: events.NewMessage.Event) -> None:
         log.info("Code is Already Claimed: %s", code)
         return
     _claimed_codes.add(code)
+
+    if CLAIM_DELAY_SECONDS > 0:
+        await asyncio.sleep(CLAIM_DELAY_SECONDS)
 
     reply_text = f"CLAIM {code}"
     try:
