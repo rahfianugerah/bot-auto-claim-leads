@@ -43,13 +43,19 @@ LEAD_BOT_USERNAME = os.environ["LEAD_BOT_USERNAME"].strip().lstrip("@")
 # here are, by definition, exactly what the bot expects back, so this is
 # more trustworthy than any other field in the message.
 # Anchored on the runner emoji so we don't match unrelated prose.
-CLAIM_LINE_RE = re.compile(r"🏃\s*CLAIM\s+([A-Za-z0-9]+)")
+#
+# \S+ (not [A-Za-z0-9]+) is deliberate: the vendor's codes can contain
+# look-alike Unicode characters (e.g. Cyrillic "E" vs Latin "E") that are
+# visually identical but are different characters. An ASCII-only class
+# stops matching at the first such character, silently truncating the
+# captured code - which reliably produces a "not found" response. \S+
+# copies the exact underlying bytes through, whatever they are.
+CLAIM_LINE_RE = re.compile(r"🏃\s*CLAIM\s+(\S+)")
 
 # Fallback only: the "Kode Kontak:" display field. Only used if the
-# action line is missing, since a rendering/typo mismatch between this
-# field and the action line (e.g. digit "0" vs letter "O" look identical
-# in most fonts) can silently produce the wrong code.
-CODE_CONTACT_RE = re.compile(r"Kode Kontak:\s*([A-Za-z0-9]+)")
+# action line is missing, since a mismatch between this field and the
+# action line can independently produce the wrong code.
+CODE_CONTACT_RE = re.compile(r"Kode Kontak:\s*(\S+)")
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
