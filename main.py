@@ -39,12 +39,17 @@ PORT = int(os.environ.get("PORT", "8080"))
 # DMs us in a new context.
 LEAD_BOT_USERNAME = os.environ["LEAD_BOT_USERNAME"].strip().lstrip("@")
 
-# Primary: the unambiguous data field
-CODE_CONTACT_RE = re.compile(r"Kode Kontak:\s*([A-Za-z0-9]+)")
-
-# Fallback: the template's own suggested action line.
-# Anchored on the runner emoji so we don't match unrelated prose
+# Primary: the bot's own literal command line - whatever characters appear
+# here are, by definition, exactly what the bot expects back, so this is
+# more trustworthy than any other field in the message.
+# Anchored on the runner emoji so we don't match unrelated prose.
 CLAIM_LINE_RE = re.compile(r"🏃\s*CLAIM\s+([A-Za-z0-9]+)")
+
+# Fallback only: the "Kode Kontak:" display field. Only used if the
+# action line is missing, since a rendering/typo mismatch between this
+# field and the action line (e.g. digit "0" vs letter "O" look identical
+# in most fonts) can silently produce the wrong code.
+CODE_CONTACT_RE = re.compile(r"Kode Kontak:\s*([A-Za-z0-9]+)")
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
@@ -59,7 +64,7 @@ OFF_COMMANDS = {"/off", "off"}
 STATUS_COMMANDS = {"/status", "status"}
 
 def extract_claim_code(text: str) -> str | None:
-    match = CODE_CONTACT_RE.search(text) or CLAIM_LINE_RE.search(text)
+    match = CLAIM_LINE_RE.search(text) or CODE_CONTACT_RE.search(text)
     return match.group(1) if match else None
 
 @client.on(events.NewMessage(from_users=LEAD_BOT_USERNAME))
@@ -74,6 +79,8 @@ async def handle_new_lead(event: events.NewMessage.Event) -> None:
     if not code:
         return
 
+    log.info("Extracted code %r from message %r", code, event.raw_text)
+
     if code in _claimed_codes:
         log.info("Code is Already Claimed: %s", code)
         return
@@ -81,10 +88,10 @@ async def handle_new_lead(event: events.NewMessage.Event) -> None:
 
     reply_text = f"CLAIM {code}"
     try:
-        await event.reply(reply_text)
-        log.info("Sent '%s' in Chat %s", reply_text, event.chat_id)
+        await event.respond(reply_text)
+        log.info("Sent %r in Chat %s", reply_text, event.chat_id)
     except Exception:
-        log.exception("Failed to Send Claim Reply for Code %s", code)
+        log.exception("Failed to Send Claim for Code %s", code)
         _claimed_codes.discard(code)
 
 @client.on(events.NewMessage(chats="me"))
