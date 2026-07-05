@@ -33,41 +33,27 @@ API_HASH = os.environ["TELEGRAM_API_HASH"]
 STRING_SESSION = os.environ["TELEGRAM_STRING_SESSION"]
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Filtering by the bot's username (sender) instead of a chat ID means we
-# don't need to know which specific chat/group the lead lands in, and it
-# keeps working automatically if we get added to a new group or the bot
-# DMs us in a new context.
 LEAD_BOT_USERNAME = os.environ["LEAD_BOT_USERNAME"].strip().lstrip("@")
 
-# Diagnostic knob: some vendor backends send the Telegram notification
-# slightly before the lead record is actually committed/claimable, so a
-# sub-second reaction can get a false "not found" that a slower human
-# reaction wouldn't hit. Set via env var so it can be tuned without a
-# code change while narrowing down the real minimum delay.
-CLAIM_DELAY_SECONDS = 1.25
+CLAIM_DELAY_SECONDS = 0.25
 
-# Primary: the bot's own literal command line - whatever characters appear
-# here are, by definition, exactly what the bot expects back, so this is
-# more trustworthy than any other field in the message.
-# Anchored on the runner emoji so we don't match unrelated prose.
-#
-# \S+ (not [A-Za-z0-9]+) is deliberate: the vendor's codes can contain
-# look-alike Unicode characters (e.g. Cyrillic "E" vs Latin "E") that are
-# visually identical but are different characters. An ASCII-only class
-# stops matching at the first such character, silently truncating the
-# captured code - which reliably produces a "not found" response. \S+
-# copies the exact underlying bytes through, whatever they are.
 CLAIM_LINE_RE = re.compile(r"🏃\s*CLAIM\s+(\S+)")
 
-# Fallback only: the "Kode Kontak:" display field. Only used if the
-# action line is missing, since a mismatch between this field and the
-# action line can independently produce the wrong code.
 CODE_CONTACT_RE = re.compile(r"Kode Kontak:\s*(\S+)")
+
+NOT_FOUND_RE = re.compile(r"kode\s+(\S+)\s+tidak ditemukan", re.IGNORECASE)
+MAX_CLAIM_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 1.5
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# Per-process dedupe so a redelivered/edited event doesn't double-claim.
-_claimed_codes: set[str] = set()
+# Tracks attempt count per code, both to dedupe first-time sends and to
+# cap retries after a "not found" response.
+_claim_attempts: dict[str, int] = {}
+
+def has_duplicate_char(code: str) -> bool:
+    letters = code.upper()
+    return len(set(letters)) != len(letters)
 
 # Toggled via /on and /off messages sent to yourself (Saved Messages).
 # Resets to True on every restart/redeploy - no persistence by design.
@@ -80,35 +66,61 @@ def extract_claim_code(text: str) -> str | None:
     match = CLAIM_LINE_RE.search(text) or CODE_CONTACT_RE.search(text)
     return match.group(1) if match else None
 
+async def send_claim(event: events.NewMessage.Event, code: str) -> None:
+    _claim_attempts[code] = _claim_attempts.get(code, 0) + 1
+    attempt = _claim_attempts[code]
+    reply_text = f"CLAIM {code}"
+    try:
+        await event.respond(reply_text)
+        log.info("Sent %r (attempt %d) in Chat %s", reply_text, attempt, event.chat_id)
+    except Exception:
+        log.exception("Failed to Send Claim for Code %s", code)
+
+
 @client.on(events.NewMessage(from_users=LEAD_BOT_USERNAME))
 async def handle_new_lead(event: events.NewMessage.Event) -> None:
     if event.out:
         return # ignore our own messages
 
+    text = event.raw_text or ""
+
+    not_found_match = NOT_FOUND_RE.search(text)
+    if not_found_match:
+        code = not_found_match.group(1)
+        attempts = _claim_attempts.get(code, 0)
+        if 0 < attempts < MAX_CLAIM_ATTEMPTS:
+            log.info("Got 'not found' for %s, retrying (attempt %d/%d)", code, attempts + 1, MAX_CLAIM_ATTEMPTS)
+            await asyncio.sleep(RETRY_DELAY_SECONDS)
+            await send_claim(event, code)
+        elif attempts >= MAX_CLAIM_ATTEMPTS:
+            log.warning("Giving up on %s after %d attempts", code, attempts)
+        return
+
     if not _auto_claim_enabled:
         return
 
-    code = extract_claim_code(event.raw_text or "")
+    code = extract_claim_code(text)
     if not code:
         return
 
-    log.info("Extracted code %r from message %r", code, event.raw_text)
+    log.info("Extracted code %r from message %r", code, text)
 
-    if code in _claimed_codes:
-        log.info("Code is Already Claimed: %s", code)
+    if code in _claim_attempts:
+        log.info("Code already attempted: %s", code)
         return
-    _claimed_codes.add(code)
+
+    if has_duplicate_char(code):
+        log.warning(
+            "Code %s has a duplicate character - past cases like this failed "
+            "with 'not found' even on a fresh, correctly-extracted code, which "
+            "looks like a vendor-side bug rather than something this script can fix",
+            code,
+        )
 
     if CLAIM_DELAY_SECONDS > 0:
         await asyncio.sleep(CLAIM_DELAY_SECONDS)
 
-    reply_text = f"CLAIM {code}"
-    try:
-        await event.respond(reply_text)
-        log.info("Sent %r in Chat %s", reply_text, event.chat_id)
-    except Exception:
-        log.exception("Failed to Send Claim for Code %s", code)
-        _claimed_codes.discard(code)
+    await send_claim(event, code)
 
 @client.on(events.NewMessage(chats="me"))
 async def handle_control_command(event: events.NewMessage.Event) -> None:
