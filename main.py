@@ -75,6 +75,36 @@ def record_claim_success(code: str) -> None:
     _all_claimed_codes.add(code)
     _claims_by_day.setdefault(today_key(), set()).add(code)
 
+
+# How far back to scan chat history on startup to seed /check with
+# claims that happened before this process last started (e.g. a
+# redeploy shouldn't reset counts back to zero for "today"/recent days).
+BACKFILL_DAYS = 30
+BACKFILL_MESSAGE_LIMIT = 5000
+
+async def backfill_claim_history() -> None:
+    cutoff = datetime.now(WIB) - timedelta(days=BACKFILL_DAYS)
+    scanned = 0
+    try:
+        async for message in client.iter_messages(LEAD_BOT_USERNAME, limit=BACKFILL_MESSAGE_LIMIT):
+            scanned += 1
+            message_date = message.date.astimezone(WIB)
+            if message_date < cutoff:
+                break
+            match = SUCCESS_RE.search(message.raw_text or "")
+            if match:
+                code = match.group(1)
+                _all_claimed_codes.add(code)
+                _claims_by_day.setdefault(message_date.strftime("%Y-%m-%d"), set()).add(code)
+        log.info(
+            "Backfilled claim history: scanned=%d, all-time=%d, today=%d",
+            scanned,
+            len(_all_claimed_codes),
+            len(_claims_by_day.get(today_key(), ())),
+        )
+    except Exception:
+        log.exception("Failed to backfill claim history")
+
 # Toggled via /on and /off messages sent to yourself (Saved Messages).
 # Resets to True on every restart/redeploy - no persistence by design.
 _auto_claim_enabled = True
@@ -198,6 +228,7 @@ async def main() -> None:
     log.info("Logged in As %s (ID=%s)", getattr(me, "username", None), me.id)
     log.info("Watching messages from @%s for Lead Claims", LEAD_BOT_USERNAME)
 
+    await backfill_claim_history()
     await run_health_server()
     await client.run_until_disconnected()
 
