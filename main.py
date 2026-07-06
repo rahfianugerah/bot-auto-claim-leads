@@ -16,10 +16,14 @@ import os
 import re
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+
+# Indonesia has no DST, so a fixed UTC+7 offset is accurate for "per day" boundaries without needing a tzdata package.
+WIB = timezone(timedelta(hours=7))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,24 +46,34 @@ CLAIM_LINE_RE = re.compile(r"🏃\s*CLAIM\s+(\S+)")
 CODE_CONTACT_RE = re.compile(r"Kode Kontak:\s*(\S+)")
 
 NOT_FOUND_RE = re.compile(r"kode\s+(\S+)\s+tidak ditemukan", re.IGNORECASE)
-# Retry fast (0.1s) but bounded to roughly the same window a human
-# competitor takes to copy-paste (~2.5s = 25 attempts at 0.1s apart).
-# Not unbounded: Telegram's own flood-control will penalize an account
-# sending messages this fast for too long, and a permanently-broken
-# code (the duplicate-character vendor bug) would otherwise retry
-# forever for no benefit.
+# Retry fast (0.1s) but bounded to roughly the same window a human competitor takes to copy-paste (~2.5s = 25 attempts at 0.1s apart).
+# Not unbounded: Telegram's own flood-control will penalize an account sending messages this fast for too long, and a permanently-broken code (the duplicate-character vendor bug) would otherwise retry forever for no benefit.
 MAX_CLAIM_ATTEMPTS = 25
 RETRY_DELAY_SECONDS = 0.1
 
+# Matches the vendor bot's own success confirmation, e.g.
+# "✅ Lead FMQRHN dari Graha Raya berhasil Anda klaim." Fires for any claim that actually succeeded - whether sent by this script or typed manually - since it's just watching the bot's own replies.
+SUCCESS_RE = re.compile(r"Lead\s+(\S+)\s+dari\s+.+?\s+berhasil Anda klaim", re.IGNORECASE)
+
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# Tracks attempt count per code, both to dedupe first-time sends and to
-# cap retries after a "not found" response.
+# Tracks attempt count per code, both to dedupe first-time sends and to cap retries after a "not found" response.
 _claim_attempts: dict[str, int] = {}
+
+# Successfully claimed codes, per calendar day (WIB) and all-time, for the /check command. In-memory only - resets on restart/redeploy, same as the on/off toggle.
+_claims_by_day: dict[str, set[str]] = {}
+_all_claimed_codes: set[str] = set()
 
 def has_duplicate_char(code: str) -> bool:
     letters = code.upper()
     return len(set(letters)) != len(letters)
+
+def today_key() -> str:
+    return datetime.now(WIB).strftime("%Y-%m-%d")
+
+def record_claim_success(code: str) -> None:
+    _all_claimed_codes.add(code)
+    _claims_by_day.setdefault(today_key(), set()).add(code)
 
 # Toggled via /on and /off messages sent to yourself (Saved Messages).
 # Resets to True on every restart/redeploy - no persistence by design.
@@ -67,6 +81,7 @@ _auto_claim_enabled = True
 ON_COMMANDS = {"/on", "on"}
 OFF_COMMANDS = {"/off", "off"}
 STATUS_COMMANDS = {"/status", "status"}
+CHECK_COMMANDS = {"/check", "check"}
 
 def extract_claim_code(text: str) -> str | None:
     match = CLAIM_LINE_RE.search(text) or CODE_CONTACT_RE.search(text)
@@ -82,13 +97,24 @@ async def send_claim(event: events.NewMessage.Event, code: str) -> None:
     except Exception:
         log.exception("Failed to Send Claim for Code %s", code)
 
-
 @client.on(events.NewMessage(from_users=LEAD_BOT_USERNAME))
 async def handle_new_lead(event: events.NewMessage.Event) -> None:
     if event.out:
         return # ignore our own messages
 
     text = event.raw_text or ""
+
+    success_match = SUCCESS_RE.search(text)
+    if success_match:
+        code = success_match.group(1)
+        record_claim_success(code)
+        log.info(
+            "Recorded successful claim for %s (today=%d, all-time=%d)",
+            code,
+            len(_claims_by_day.get(today_key(), ())),
+            len(_all_claimed_codes),
+        )
+        return
 
     not_found_match = NOT_FOUND_RE.search(text)
     if not_found_match:
@@ -105,7 +131,7 @@ async def handle_new_lead(event: events.NewMessage.Event) -> None:
         return
 
     if not _auto_claim_enabled:
-        log.info("Auto Claim is Off, Not Processing %s", code)
+        log.info("Auto Claim is Off, Not Processing New Lead")
         return
 
     code = extract_claim_code(text)
@@ -147,6 +173,12 @@ async def handle_control_command(event: events.NewMessage.Event) -> None:
     elif text in STATUS_COMMANDS:
         state = "ON" if _auto_claim_enabled else "OFF"
         await event.respond(f"Auto Claim is Currently {state}.")
+    elif text in CHECK_COMMANDS:
+        today_count = len(_claims_by_day.get(today_key(), ()))
+        all_time_count = len(_all_claimed_codes)
+        await event.respond(
+            f"📊 Leads Claimed Today: {today_count}\nAll Time: {all_time_count}"
+        )
 
 async def health(_request: web.Request) -> web.Response:
     return web.Response(text="ok")
