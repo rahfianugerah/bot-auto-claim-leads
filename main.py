@@ -35,7 +35,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 LEAD_BOT_USERNAME = os.environ["LEAD_BOT_USERNAME"].strip().lstrip("@")
 
-CLAIM_DELAY_SECONDS = 0.2
+CLAIM_DELAY_SECONDS = 0.1
 
 CLAIM_LINE_RE = re.compile(r"🏃\s*CLAIM\s+(\S+)")
 
