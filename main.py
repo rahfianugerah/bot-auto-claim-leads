@@ -35,15 +35,21 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 LEAD_BOT_USERNAME = os.environ["LEAD_BOT_USERNAME"].strip().lstrip("@")
 
-CLAIM_DELAY_SECONDS = 0.25
+CLAIM_DELAY_SECONDS = 0.2
 
 CLAIM_LINE_RE = re.compile(r"🏃\s*CLAIM\s+(\S+)")
 
 CODE_CONTACT_RE = re.compile(r"Kode Kontak:\s*(\S+)")
 
 NOT_FOUND_RE = re.compile(r"kode\s+(\S+)\s+tidak ditemukan", re.IGNORECASE)
-MAX_CLAIM_ATTEMPTS = 3
-RETRY_DELAY_SECONDS = 1.5
+# Retry fast (0.1s) but bounded to roughly the same window a human
+# competitor takes to copy-paste (~2.5s = 25 attempts at 0.1s apart).
+# Not unbounded: Telegram's own flood-control will penalize an account
+# sending messages this fast for too long, and a permanently-broken
+# code (the duplicate-character vendor bug) would otherwise retry
+# forever for no benefit.
+MAX_CLAIM_ATTEMPTS = 25
+RETRY_DELAY_SECONDS = 0.1
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
@@ -88,8 +94,10 @@ async def handle_new_lead(event: events.NewMessage.Event) -> None:
     if not_found_match:
         code = not_found_match.group(1)
         attempts = _claim_attempts.get(code, 0)
-        if 0 < attempts < MAX_CLAIM_ATTEMPTS:
-            log.info("Got 'not found' for %s, retrying (attempt %d/%d)", code, attempts + 1, MAX_CLAIM_ATTEMPTS)
+        if not _auto_claim_enabled:
+            log.info("Auto Claim is Off, Not Retrying %s", code)
+        elif 0 < attempts < MAX_CLAIM_ATTEMPTS:
+            log.info("Got 'Not Found' for %s, Retrying (Attempt %d/%d)", code, attempts + 1, MAX_CLAIM_ATTEMPTS)
             await asyncio.sleep(RETRY_DELAY_SECONDS)
             await send_claim(event, code)
         elif attempts >= MAX_CLAIM_ATTEMPTS:
@@ -97,6 +105,7 @@ async def handle_new_lead(event: events.NewMessage.Event) -> None:
         return
 
     if not _auto_claim_enabled:
+        log.info("Auto Claim is Off, Not Processing %s", code)
         return
 
     code = extract_claim_code(text)
